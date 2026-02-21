@@ -6,14 +6,14 @@ Run with: streamlit run app.py
 
 The UI is organized into sections:
   1. Ticker lookup and auto-population via web scraping
-  2. Current ETF position inputs (editable, pre-filled if scraped)
+  2. Current ETF position inputs (fund return, ref return, cap/buffer levels)
   3. Replacement ETF inputs
   4. Account and tax settings
   5. Scenario analysis results:
-     - Current ETF status summary
+     - Current position risk metrics (downside to buffer, remaining cap)
      - Hold vs. Roll comparison chart (Plotly)
-     - Scenario table with conditional formatting
-     - Breakeven and recommendation
+     - Scenario table with investor returns from current NAV
+     - ALL breakeven points and recommendation
 """
 
 import streamlit as st
@@ -23,7 +23,7 @@ import numpy as np
 from datetime import date, timedelta
 
 from scraper import scrape_etf_page, get_ticker_suggestions, get_ticker_description, INNOVATOR_TICKERS
-from payoff import PayoffParams, calculate_buffer_etf_return, estimate_remaining_params
+from payoff import calculate_downside_metrics, calculate_hold_investor_return
 from scenarios import ScenarioInputs, run_scenarios
 from tax import TaxParams, format_tax_summary
 
@@ -41,15 +41,14 @@ st.set_page_config(
 st.title("Buffer ETF Rollover Analyzer")
 st.markdown(
     "Compare the expected outcomes of **holding** your current buffer ETF through "
-    "its reset date versus **rolling** into a fresh ETF with a new cap and buffer."
+    "its reset date versus **rolling** into a fresh ETF with a new cap and buffer. "
+    "All returns are shown as **investor returns from current fund NAV**."
 )
 
 
 # ---------------------------------------------------------------------------
 # Session state initialization
 # ---------------------------------------------------------------------------
-# We use session state to persist scraped data and avoid re-scraping on every
-# Streamlit rerun (which happens on any widget interaction).
 if "scraped_data" not in st.session_state:
     st.session_state.scraped_data = None
 if "scrape_attempted" not in st.session_state:
@@ -66,7 +65,6 @@ with st.sidebar:
         "[innovatoretfs.com](https://www.innovatoretfs.com)."
     )
 
-    # Ticker input with suggestions
     ticker = st.text_input(
         "Ticker Symbol",
         value="BJUL",
@@ -74,17 +72,14 @@ with st.sidebar:
         help="Enter an Innovator Buffer ETF ticker (e.g., BJUL, PAPR, UOCT).",
     ).upper().strip()
 
-    # Show ticker description if known
     if ticker in INNOVATOR_TICKERS:
         st.caption(f"_{get_ticker_description(ticker)}_")
 
-    # Scrape button
     if st.button("Fetch Data from Innovator", type="primary", use_container_width=True):
         with st.spinner(f"Fetching data for {ticker}..."):
             st.session_state.scraped_data = scrape_etf_page(ticker)
             st.session_state.scrape_attempted = True
 
-    # Show scrape status
     if st.session_state.scrape_attempted:
         data = st.session_state.scraped_data
         if data and data.scrape_successful:
@@ -98,7 +93,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Quick reference: common ticker table
     with st.expander("Common Innovator ETF Tickers"):
         ticker_df = pd.DataFrame([
             {"Ticker": t, "Type": d}
@@ -111,12 +105,7 @@ with st.sidebar:
 # Helper: get scraped value or default
 # ---------------------------------------------------------------------------
 def scraped_or_default(field_name: str, default):
-    """
-    Return the scraped value for a field if available, otherwise the default.
-
-    This lets us pre-fill input fields with scraped data while still allowing
-    the user to override anything.
-    """
+    """Return the scraped value for a field if available, otherwise the default."""
     data = st.session_state.scraped_data
     if data and data.scrape_successful:
         value = getattr(data, field_name, None)
@@ -130,7 +119,6 @@ def scraped_or_default(field_name: str, default):
 # ---------------------------------------------------------------------------
 st.header("Current ETF Position")
 
-# Show a badge if values were auto-populated
 if st.session_state.scraped_data and st.session_state.scraped_data.scrape_successful:
     st.info(
         "Fields below have been auto-populated from Innovator ETFs. "
@@ -142,7 +130,6 @@ col1, col2, col3 = st.columns(3)
 with col1:
     st.subheader("Outcome Period")
 
-    # Default dates: assume a standard 1-year outcome period
     default_start = scraped_or_default(
         "outcome_period_start",
         date.today() - timedelta(days=180),
@@ -170,38 +157,59 @@ with col1:
     st.progress(days_elapsed / total_days, text=f"{days_elapsed}/{total_days} days elapsed")
 
 with col2:
-    st.subheader("Cap & Buffer Levels")
+    st.subheader("Returns & Levels")
 
-    # Starting values (at period inception)
-    starting_cap_pct = st.number_input(
-        "Starting Cap (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=scraped_or_default("starting_cap", 0.15) * 100,
+    fund_return_pct = st.number_input(
+        "Fund Return from Period Start (%)",
+        min_value=-99.0,
+        max_value=200.0,
+        value=scraped_or_default("fund_return", 0.10) * 100,
         step=0.1,
         format="%.2f",
-        help="The cap level set at the beginning of the outcome period.",
+        help=(
+            "How much the fund NAV has changed since the outcome period started. "
+            "Example: if the fund started at $30 and is now $33, enter 10.00."
+        ),
     )
 
-    starting_buffer_pct = st.number_input(
-        "Starting Buffer (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=scraped_or_default("starting_buffer", 0.09) * 100,
+    ref_return_pct = st.number_input(
+        "Reference Asset Return from Period Start (%)",
+        min_value=-99.0,
+        max_value=500.0,
+        value=scraped_or_default("ref_return", 0.15) * 100,
         step=0.1,
         format="%.2f",
-        help="The buffer level set at the beginning of the outcome period.",
+        help=(
+            "How much the reference index (e.g., S&P 500) has changed since "
+            "the outcome period started. This is NOT the same as the fund return."
+        ),
     )
 
-    # Remaining values (from current price)
-    remaining_cap_pct = st.number_input(
-        "Remaining Cap (%)",
+    ref_return_to_cap_pct = st.number_input(
+        "Ref Return to Cap (%)",
         min_value=0.0,
         max_value=200.0,
-        value=scraped_or_default("remaining_cap", 0.10) * 100,
+        value=scraped_or_default("ref_return_to_cap", 0.03) * 100,
         step=0.1,
         format="%.2f",
-        help="Maximum additional upside from the current ETF price to the cap.",
+        help=(
+            "How much more the reference asset can return (from its current level) "
+            "before the cap is hit. Starting cap = ref return + this value."
+        ),
+    )
+
+    remaining_cap_pct = st.number_input(
+        "Remaining Cap — from Fund NAV (%)",
+        min_value=0.0,
+        max_value=200.0,
+        value=scraped_or_default("remaining_cap", 0.073) * 100,
+        step=0.1,
+        format="%.2f",
+        help=(
+            "Maximum additional return the fund can achieve from its current NAV. "
+            "This is published by Innovator and differs from the reference-asset "
+            "distance to cap."
+        ),
     )
 
     remaining_buffer_pct = st.number_input(
@@ -211,29 +219,14 @@ with col2:
         value=scraped_or_default("remaining_buffer", 0.09) * 100,
         step=0.1,
         format="%.2f",
-        help="Remaining downside protection from the current ETF price.",
+        help=(
+            "Remaining downside protection as published by Innovator. "
+            "For standard buffers: equals starting buffer when ref is positive."
+        ),
     )
 
 with col3:
-    st.subheader("NAV & Position")
-
-    starting_nav = st.number_input(
-        "Starting NAV ($)",
-        min_value=0.01,
-        value=scraped_or_default("starting_nav", 30.00),
-        step=0.01,
-        format="%.2f",
-        help="NAV at the beginning of the outcome period.",
-    )
-
-    current_nav = st.number_input(
-        "Current NAV ($)",
-        min_value=0.01,
-        value=scraped_or_default("current_nav", 31.50),
-        step=0.01,
-        format="%.2f",
-        help="Current net asset value of the ETF.",
-    )
+    st.subheader("Position & Type")
 
     position_value = st.number_input(
         "Position Size ($)",
@@ -244,7 +237,6 @@ with col3:
         help="Total dollar value of your current position.",
     )
 
-    # ETF type selector for ultra buffers
     etf_type = st.selectbox(
         "Buffer Type",
         options=["Standard (9%)", "Power (15%)", "Ultra (5-35%)", "Custom"],
@@ -391,7 +383,7 @@ col_sc1, col_sc2, col_sc3 = st.columns(3)
 
 with col_sc1:
     min_return_pct = st.number_input(
-        "Min Forward Return (%)",
+        "Min Forward Ref Return (%)",
         min_value=-80.0,
         max_value=0.0,
         value=-30.0,
@@ -401,7 +393,7 @@ with col_sc1:
 
 with col_sc2:
     max_return_pct = st.number_input(
-        "Max Forward Return (%)",
+        "Max Forward Ref Return (%)",
         min_value=0.0,
         max_value=100.0,
         value=30.0,
@@ -428,6 +420,9 @@ st.divider()
 if st.button("Run Analysis", type="primary", use_container_width=True):
 
     # Convert percentage inputs to decimals
+    fund_return = fund_return_pct / 100.0
+    ref_return = ref_return_pct / 100.0
+    ref_return_to_cap = ref_return_to_cap_pct / 100.0
     remaining_cap = remaining_cap_pct / 100.0
     remaining_buffer = remaining_buffer_pct / 100.0
     new_cap = new_cap_pct / 100.0
@@ -435,6 +430,18 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
     transaction_cost_rate = transaction_cost_bps / 10_000.0
     current_gap = current_gap_pct / 100.0
     new_gap = new_gap_pct / 100.0
+
+    # Derive starting cap from reference return + distance to cap
+    starting_cap = ref_return + ref_return_to_cap
+
+    # Derive starting buffer from remaining buffer and current ref position
+    # If ref >= 0: buffer hasn't been consumed, starting_buffer = remaining_buffer
+    # If ref < 0: some buffer consumed, starting_buffer = remaining_buffer + consumed
+    if ref_return >= 0:
+        starting_buffer = remaining_buffer
+    else:
+        consumed = max(0.0, abs(ref_return) - current_gap)
+        starting_buffer = remaining_buffer + consumed
 
     # Build tax params
     tax_params = TaxParams(
@@ -447,9 +454,13 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
     # Build scenario inputs
     inputs = ScenarioInputs(
         position_value=position_value,
+        fund_return=fund_return,
+        ref_return=ref_return,
+        starting_cap=starting_cap,
+        starting_buffer=starting_buffer,
         remaining_cap=remaining_cap,
         remaining_buffer=remaining_buffer,
-        current_downside_before_buffer=current_gap,
+        downside_before_buffer=current_gap,
         new_cap=new_cap,
         new_buffer=new_buffer,
         new_downside_before_buffer=new_gap,
@@ -460,55 +471,98 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
         return_step=step_pct / 100.0,
     )
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Run the scenario engine
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     result = run_scenarios(inputs)
 
-    # -----------------------------------------------------------------------
-    # Output Section A: Current ETF Status
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Output Section A: Current Position Risk Metrics
+    # -------------------------------------------------------------------
     st.header("Results")
 
-    st.subheader("Current ETF Status")
-    current_return = (current_nav / starting_nav - 1.0) if starting_nav > 0 else 0.0
+    st.subheader("Current Position Risk Metrics")
 
-    status_cols = st.columns(4)
-    with status_cols[0]:
-        st.metric(
-            "Remaining Cap",
-            f"{remaining_cap_pct:.2f}%",
-            help="Maximum additional upside from here.",
+    metrics = calculate_downside_metrics(
+        fund_return=fund_return,
+        current_ref_return=ref_return,
+        starting_cap=starting_cap,
+        starting_buffer=starting_buffer,
+        downside_before_buffer=current_gap,
+    )
+
+    # Cross-validation: compare derived remaining cap with user input
+    derived_remaining_cap = metrics["remaining_cap_from_nav"]
+    cap_diff = abs(derived_remaining_cap - remaining_cap)
+    if cap_diff > 0.005:  # More than 0.5% difference
+        st.warning(
+            f"The remaining cap you entered ({remaining_cap:.2%}) differs from "
+            f"the value derived from your other inputs ({derived_remaining_cap:.2%}). "
+            f"This may indicate a data entry inconsistency."
         )
-    with status_cols[1]:
+
+    metric_cols = st.columns(5)
+    with metric_cols[0]:
+        st.metric(
+            "Remaining Cap (Fund NAV)",
+            f"{remaining_cap_pct:.2f}%",
+            help="Maximum additional return from current fund NAV to cap.",
+        )
+    with metric_cols[1]:
         st.metric(
             "Remaining Buffer",
             f"{remaining_buffer_pct:.2f}%",
-            help="Remaining downside protection.",
+            help="Remaining downside protection from period start level.",
         )
-    with status_cols[2]:
+    with metric_cols[2]:
+        st.metric(
+            "Downside to Period Start",
+            f"{metrics['downside_to_period_start']:+.2%}",
+            help=(
+                "How much the fund NAV would drop from current if the reference "
+                "asset returns to its period-start level (0% from start). This is "
+                "the unprotected portion of your gain."
+            ),
+        )
+    with metric_cols[3]:
+        st.metric(
+            "Downside to Buffer Exhaustion",
+            f"{metrics['downside_to_buffer_exhaustion']:+.2%}",
+            help=(
+                "Investor return from current NAV when the reference asset has "
+                "fallen enough to exhaust the entire buffer. Beyond this, losses "
+                "are 1:1."
+            ),
+        )
+    with metric_cols[4]:
         st.metric(
             "Days Left",
             f"{days_remaining}",
             help="Calendar days until the outcome period resets.",
         )
-    with status_cols[3]:
-        st.metric(
-            "Current Gain/Loss",
-            f"{current_return:+.2%}",
-            delta=f"${position_value * current_return:+,.0f}",
-            help="Return since the outcome period started.",
-        )
+
+    # Derived values info box
+    with st.expander("Derived Values"):
+        st.markdown(f"""
+        | Metric | Value |
+        |--------|-------|
+        | Starting Cap (derived) | {starting_cap:.2%} |
+        | Starting Buffer (derived) | {starting_buffer:.2%} |
+        | Remaining Cap from NAV (derived) | {derived_remaining_cap:.2%} |
+        | Ref Forward to Period Start | {metrics['ref_forward_to_zero']:+.2%} |
+        | Ref Forward to Buffer Edge | {metrics['ref_forward_to_buffer_edge']:+.2%} |
+        | Ref Forward to Cap | {metrics['ref_forward_to_cap']:+.2%} |
+        """)
 
     # Show tax impact if taxable
     if is_taxable:
         tax_summary = format_tax_summary(position_value, tax_params)
         st.info(f"**Tax Impact if Rolling:** {tax_summary['description']}")
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Output Section B: Hold vs. Roll Comparison Chart
-    # -----------------------------------------------------------------------
-    st.subheader("Hold vs. Roll Comparison")
+    # -------------------------------------------------------------------
+    st.subheader("Hold vs. Roll: Investor Return from Current NAV")
 
     df = result.scenario_df
 
@@ -516,70 +570,81 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
 
     # Hold line
     fig.add_trace(go.Scatter(
-        x=df["Market Return"] * 100,
-        y=df["Hold Value"],
+        x=df["Forward Ref Return"] * 100,
+        y=df["Hold Return"] * 100,
         mode="lines",
         name="Hold Current ETF",
         line=dict(color="#1f77b4", width=3),
-        hovertemplate="Market: %{x:.1f}%<br>Hold Value: $%{y:,.0f}<extra></extra>",
+        hovertemplate=(
+            "Forward Ref: %{x:.1f}%<br>"
+            "Hold Return: %{y:.2f}%<extra></extra>"
+        ),
     ))
 
     # Roll line
     fig.add_trace(go.Scatter(
-        x=df["Market Return"] * 100,
-        y=df["Roll Value"],
+        x=df["Forward Ref Return"] * 100,
+        y=df["Roll Return"] * 100,
         mode="lines",
         name="Roll to New ETF",
         line=dict(color="#ff7f0e", width=3),
-        hovertemplate="Market: %{x:.1f}%<br>Roll Value: $%{y:,.0f}<extra></extra>",
+        hovertemplate=(
+            "Forward Ref: %{x:.1f}%<br>"
+            "Roll Return: %{y:.2f}%<extra></extra>"
+        ),
     ))
 
-    # Breakeven marker
-    if result.breakeven_return is not None:
-        # Interpolate the value at breakeven
-        be_pct = result.breakeven_return * 100
-        # Find the approximate hold value at breakeven
-        hold_params_temp = PayoffParams(
-            cap=remaining_cap, buffer=remaining_buffer,
+    # Plot ALL breakeven markers
+    for idx, (be_return, be_above) in enumerate(result.breakevens):
+        be_pct = be_return * 100
+        # Calculate hold return at breakeven for the marker position
+        be_hold_return = calculate_hold_investor_return(
+            forward_ref_return=be_return,
+            current_ref_return=ref_return,
+            fund_return=fund_return,
+            starting_cap=starting_cap,
+            starting_buffer=starting_buffer,
             downside_before_buffer=current_gap,
-        )
-        be_etf_ret = calculate_buffer_etf_return(result.breakeven_return, hold_params_temp)
-        be_value = position_value * (1.0 + be_etf_ret)
+        ) * 100
+
+        label = f"BE{idx + 1}" if len(result.breakevens) > 1 else "BE"
 
         fig.add_trace(go.Scatter(
             x=[be_pct],
-            y=[be_value],
+            y=[be_hold_return],
             mode="markers+text",
-            name=f"Breakeven ({be_pct:+.1f}%)",
+            name=f"{label}: {be_pct:+.1f}%",
             marker=dict(color="red", size=14, symbol="diamond"),
-            text=[f"Breakeven: {be_pct:+.1f}%"],
+            text=[f"{label}: {be_pct:+.1f}%"],
             textposition="top center",
             textfont=dict(size=12, color="red"),
-            hovertemplate=f"Breakeven: {be_pct:+.1f}%<br>Value: ${be_value:,.0f}<extra></extra>",
+            hovertemplate=(
+                f"{label}: {be_pct:+.1f}%<br>"
+                f"Return: {be_hold_return:.2f}%<extra></extra>"
+            ),
         ))
 
-        # Add vertical line at breakeven
         fig.add_vline(
             x=be_pct, line_dash="dash", line_color="red",
-            annotation_text=f"Breakeven: {be_pct:+.1f}%",
+            annotation_text=f"{label}: {be_pct:+.1f}%",
             annotation_position="top",
         )
 
-    # Add horizontal line at current position value
+    # Add horizontal line at 0% (no change from current NAV)
     fig.add_hline(
-        y=position_value, line_dash="dot", line_color="gray",
-        annotation_text=f"Current Value: ${position_value:,.0f}",
+        y=0, line_dash="dot", line_color="gray",
+        annotation_text="No change from current NAV",
         annotation_position="bottom right",
     )
 
-    # Add vertical line at 0% return
+    # Add vertical line at 0% forward return
     fig.add_vline(x=0, line_dash="dot", line_color="gray", opacity=0.5)
 
     fig.update_layout(
-        title="Ending Position Value: Hold vs. Roll",
-        xaxis_title="Forward Market Return (%)",
-        yaxis_title="Ending Position Value ($)",
-        yaxis_tickformat="$,.0f",
+        title="Investor Return from Current NAV: Hold vs. Roll",
+        xaxis_title="Forward Reference Asset Return (%)",
+        yaxis_title="Investor Return from Current NAV (%)",
+        yaxis_ticksuffix="%",
         hovermode="x unified",
         legend=dict(
             orientation="h",
@@ -594,24 +659,31 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Output Section C: Scenario Table
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     st.subheader("Scenario Table")
 
-    # Format the table for display
     display_df = df.copy()
-    display_df["Market Return"] = display_df["Market Return"].apply(lambda x: f"{x:+.1%}")
-    display_df["Hold Value"] = display_df["Hold Value"].apply(lambda x: f"${x:,.0f}")
-    display_df["Roll Value"] = display_df["Roll Value"].apply(lambda x: f"${x:,.0f}")
-    display_df["Hold Return"] = display_df["Hold Return"].apply(lambda x: f"{x:+.2%}")
-    display_df["Roll Return"] = display_df["Roll Return"].apply(lambda x: f"{x:+.2%}")
+    display_df["Forward Ref Return"] = display_df["Forward Ref Return"].apply(
+        lambda x: f"{x:+.1%}"
+    )
+    display_df["Hold Return"] = display_df["Hold Return"].apply(
+        lambda x: f"{x:+.2%}"
+    )
+    display_df["Roll Return"] = display_df["Roll Return"].apply(
+        lambda x: f"{x:+.2%}"
+    )
+    display_df["Hold Value"] = display_df["Hold Value"].apply(
+        lambda x: f"${x:,.0f}"
+    )
+    display_df["Roll Value"] = display_df["Roll Value"].apply(
+        lambda x: f"${x:,.0f}"
+    )
     display_df["Roll Advantage ($)"] = display_df["Roll Advantage ($)"].apply(
         lambda x: f"${x:+,.0f}"
     )
 
-    # Apply conditional formatting using Streamlit's native styling
-    # We use a custom function to highlight rows
     def highlight_winner(row):
         """Apply green/red background based on which strategy wins."""
         if row["Winner"] == "roll":
@@ -623,36 +695,25 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
     st.dataframe(styled_df, use_container_width=True, height=400)
 
     st.caption(
-        "Green rows: Rolling is advantageous. Red rows: Holding is advantageous."
+        "Green rows: Rolling is advantageous. Red rows: Holding is advantageous. "
+        "All returns are from the investor's current fund NAV."
     )
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Output Section D: Breakeven & Recommendation
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     st.subheader("Breakeven Analysis & Recommendation")
 
-    if result.breakeven_return is not None:
-        be_col1, be_col2 = st.columns([1, 2])
-        with be_col1:
-            st.metric(
-                "Breakeven Market Return",
-                f"{result.breakeven_return * 100:+.1f}%",
-                help="The forward market return at which hold and roll produce equal outcomes.",
-            )
-        with be_col2:
-            if result.roll_wins_above:
-                st.markdown(
-                    f"Rolling wins if the market returns **above** "
-                    f"{result.breakeven_return * 100:+.1f}%.  \n"
-                    f"Holding wins if the market returns **below** "
-                    f"{result.breakeven_return * 100:+.1f}%."
-                )
-            else:
-                st.markdown(
-                    f"Rolling wins if the market returns **below** "
-                    f"{result.breakeven_return * 100:+.1f}%.  \n"
-                    f"Holding wins if the market returns **above** "
-                    f"{result.breakeven_return * 100:+.1f}%."
+    if result.breakevens:
+        be_cols = st.columns(min(len(result.breakevens), 4))
+        for idx, (be_return, be_above) in enumerate(result.breakevens):
+            with be_cols[idx % len(be_cols)]:
+                label = f"Breakeven #{idx + 1}" if len(result.breakevens) > 1 else "Breakeven"
+                direction = "above" if be_above else "below"
+                st.metric(
+                    label,
+                    f"{be_return * 100:+.1f}%",
+                    help=f"Roll wins {direction} this forward ref return.",
                 )
     else:
         st.info(
@@ -668,84 +729,42 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
         disabled=True,
     )
 
-    # -----------------------------------------------------------------------
-    # Output Section E: Payoff Diagram (educational)
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Output Section E: Payoff Explanation (educational)
+    # -------------------------------------------------------------------
     with st.expander("Understanding the Buffer ETF Payoff Structure"):
         st.markdown("""
         **How Buffer ETFs Work:**
 
-        Buffer ETFs use options to create a defined outcome over a fixed period (usually 1 year):
+        Buffer ETFs use FLEX options to create a defined outcome over a fixed period
+        (usually 1 year):
 
-        - **Capped Upside:** Gains are limited to the cap level. If the S&P 500 returns 25%
-          but the cap is 15%, the ETF returns 15%.
+        - **Capped Upside:** Gains are limited to the cap level. If the S&P 500 returns
+          25% but the cap is 15%, the ETF returns 15%.
         - **Buffered Downside:** Losses up to the buffer level are absorbed. If the S&P 500
           drops 7% and the buffer is 9%, the ETF returns 0% (no loss).
         - **Beyond the Buffer:** Losses exceeding the buffer pass through 1:1. If the S&P 500
           drops 20% and the buffer is 9%, the ETF returns -11% (20% - 9%).
 
-        **Why the Remaining Cap/Buffer Matter:**
+        **Why Fund Return != Reference Asset Return Mid-Period:**
 
-        As the underlying index moves during the outcome period, the remaining cap and buffer
-        shift. If the market has already risen 5% and the starting cap was 15%, the remaining
-        cap is approximately 10%. The remaining buffer also adjusts.
+        Mid-period, the fund NAV does NOT track the reference asset 1:1. The fund's
+        options still embed time value. If the S&P is up 15%, the fund might only be up
+        10%. This difference narrows as the outcome period end approaches.
+
+        **The "Downside to Period Start" Risk:**
+
+        If the fund is up 10%, the client has 10% of unrealized gain. If the reference
+        asset returns to 0% from period start, the at-expiry payoff is 0% — meaning the
+        fund NAV goes back to its starting value. The client loses their 10% gain. The
+        buffer only protects against losses BELOW the period-start level.
 
         **The Roll Decision:**
 
         When a new ETF launches with a fresh cap (say 16%), it may be advantageous to sell
-        the current ETF (with only 10% remaining cap) and buy the new one — provided the
-        benefits outweigh the transaction costs and any tax drag.
+        the current ETF and buy the new one — provided the benefits outweigh the transaction
+        costs, tax drag, and the risk of giving up the current position's characteristics.
         """)
-
-        # Draw the payoff diagram
-        payoff_returns = np.arange(-0.35, 0.35, 0.005)
-
-        hold_payoffs = [
-            calculate_buffer_etf_return(r, PayoffParams(
-                cap=remaining_cap, buffer=remaining_buffer,
-                downside_before_buffer=current_gap,
-            )) for r in payoff_returns
-        ]
-        roll_payoffs = [
-            calculate_buffer_etf_return(r, PayoffParams(
-                cap=new_cap, buffer=new_buffer,
-                downside_before_buffer=new_gap,
-            )) for r in payoff_returns
-        ]
-
-        payoff_fig = go.Figure()
-        payoff_fig.add_trace(go.Scatter(
-            x=payoff_returns * 100,
-            y=[p * 100 for p in hold_payoffs],
-            mode="lines",
-            name=f"Current ETF (Cap: {remaining_cap_pct:.1f}%, Buffer: {remaining_buffer_pct:.1f}%)",
-            line=dict(color="#1f77b4", width=2),
-        ))
-        payoff_fig.add_trace(go.Scatter(
-            x=payoff_returns * 100,
-            y=[p * 100 for p in roll_payoffs],
-            mode="lines",
-            name=f"New ETF (Cap: {new_cap_pct:.1f}%, Buffer: {new_buffer_pct:.1f}%)",
-            line=dict(color="#ff7f0e", width=2),
-        ))
-        # 1:1 reference line
-        payoff_fig.add_trace(go.Scatter(
-            x=payoff_returns * 100,
-            y=payoff_returns * 100,
-            mode="lines",
-            name="Unprotected (1:1)",
-            line=dict(color="gray", width=1, dash="dot"),
-        ))
-
-        payoff_fig.update_layout(
-            title="Payoff Structure Comparison",
-            xaxis_title="Underlying Market Return (%)",
-            yaxis_title="ETF Return (%)",
-            height=400,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-
-        st.plotly_chart(payoff_fig, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------

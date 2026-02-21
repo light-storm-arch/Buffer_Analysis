@@ -63,6 +63,13 @@ class ETFData:
 
     All percentage fields are stored as decimals (e.g., 0.15 for 15%).
     Dates are stored as Python date objects.
+
+    Key fields align with the app.py input model:
+      - fund_return: Fund NAV change from period start
+      - ref_return: Reference asset change from period start
+      - ref_return_to_cap: How much more the ref can return before cap
+      - remaining_cap: Max additional return from current fund NAV
+      - remaining_buffer: Remaining downside protection
     """
     ticker: str = ""
 
@@ -70,15 +77,18 @@ class ETFData:
     outcome_period_start: Optional[date] = None
     reset_date: Optional[date] = None
 
-    # Cap levels (as decimals, e.g., 0.15 = 15%)
-    starting_cap: Optional[float] = None
-    remaining_cap: Optional[float] = None
+    # Returns from period start (as decimals)
+    fund_return: Optional[float] = None
+    ref_return: Optional[float] = None
+    ref_return_to_cap: Optional[float] = None
 
-    # Buffer levels (as decimals)
-    starting_buffer: Optional[float] = None
+    # Remaining levels from current NAV (as decimals)
+    remaining_cap: Optional[float] = None
     remaining_buffer: Optional[float] = None
 
-    # NAV values
+    # Legacy fields kept for backward compatibility with scraping logic
+    starting_cap: Optional[float] = None
+    starting_buffer: Optional[float] = None
     starting_nav: Optional[float] = None
     current_nav: Optional[float] = None
 
@@ -87,10 +97,10 @@ class ETFData:
     scrape_message: str = ""
     scrape_timestamp: Optional[datetime] = None
 
-    # Additional fields that may be available
+    # Additional fields
     fund_name: str = ""
     underlying_index: str = "S&P 500"
-    downside_before_buffer: Optional[float] = None  # For ultra buffers (e.g., -5%)
+    downside_before_buffer: Optional[float] = None  # For ultra buffers
 
     def days_remaining(self) -> Optional[int]:
         """Calculate trading days remaining until reset date."""
@@ -101,6 +111,8 @@ class ETFData:
 
     def current_return(self) -> Optional[float]:
         """Calculate the current return since outcome period start."""
+        if self.fund_return is not None:
+            return self.fund_return
         if self.starting_nav and self.current_nav and self.starting_nav > 0:
             return (self.current_nav / self.starting_nav) - 1.0
         return None

@@ -1,10 +1,11 @@
 """
 payoff.py — Buffer ETF Payoff Calculation Engine
 
-This module models the payoff structure of buffer ETFs. These products use
-options to create a "defined outcome" over a fixed period (typically 1 year):
+This module models the payoff structure of buffer ETFs at expiry. These
+products use FLEX options to create a "defined outcome" over a fixed period
+(typically 1 year):
 
-  - CAPPED UPSIDE: Gains are capped at the cap level. If the underlying index
+  - CAPPED UPSIDE: Gains are capped at the cap level. If the reference asset
     returns more than the cap, the ETF returns only the cap amount.
 
   - BUFFERED DOWNSIDE: Losses up to the buffer level are absorbed (the investor
@@ -16,42 +17,48 @@ options to create a "defined outcome" over a fixed period (typically 1 year):
 
 Payoff Diagram (Standard Buffer ETF, e.g., 15% cap, 9% buffer):
 
-  ETF Return
+  ETF Return (at expiry, from period start)
     ^
     |         ___________  <- Cap (15%)
     |        /
     |       /
     |      /   <- 1:1 participation between 0% and cap
     |     /
-    +----+-----------------> Underlying Return
+    +----+-----------------> Reference Asset Return (from period start)
     |    |    |
     |    0%  -9%  <- Buffer absorbs losses
     |         \
     |          \   <- 1:1 loss beyond buffer
     |           \
 
-This module calculates the expected ETF return for any given underlying
-market return, accounting for:
-  - Where we are in the outcome period (remaining cap/buffer vs. starting)
-  - Whether we're modeling a "hold to reset" or "roll into new ETF" strategy
+IMPORTANT — Fund Return vs. Reference Asset Return:
 
-Key Concepts:
-  - "Starting" values: The cap/buffer at the beginning of the outcome period.
-  - "Remaining" values: The cap/buffer available from the current price/date.
-    As the underlying index rises, remaining cap decreases and remaining buffer
-    increases (and vice versa).
-  - The payoff from "here to reset" uses remaining cap and remaining buffer.
-  - A new ETF uses its fresh starting cap and starting buffer.
+  Mid-period, the fund NAV does NOT track the reference asset 1:1. If the
+  S&P 500 is up 15% from period start, the fund might only be up 10% because
+  the options still embed time value. The fund converges toward the at-expiry
+  payoff as the outcome period end approaches.
+
+  This means:
+    - "Remaining cap" (in fund-NAV terms) can differ from the reference asset's
+      distance to cap.
+    - An investor who is up 10% in fund NAV has 10% of unrealized gain at risk
+      BEFORE the buffer provides any protection.
+
+  The correct way to model "hold to expiry" is:
+    1. Compound the forward reference asset return with the current reference
+       return to get the total return from period start.
+    2. Apply the at-expiry payoff function using the STARTING cap and buffer.
+    3. Convert the resulting fund NAV at expiry back to an investor return
+       relative to the current fund NAV.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
 class PayoffParams:
     """
-    Parameters defining a buffer ETF's payoff structure.
+    Parameters defining a buffer ETF's at-expiry payoff structure.
 
     All percentage values are stored as decimals (e.g., 0.15 for 15%).
 
@@ -83,46 +90,39 @@ def calculate_buffer_etf_return(
     params: PayoffParams,
 ) -> float:
     """
-    Calculate the buffer ETF return for a given underlying market return.
+    Calculate the buffer ETF return at expiry for a given reference asset return.
 
-    This is the core payoff function. It models the three-segment piecewise
-    linear payoff structure of a buffer ETF:
+    This models the at-expiry piecewise linear payoff. Both the input
+    (market_return) and output are returns measured from the SAME starting
+    point (the outcome period start).
 
-      1. If market goes up: ETF return = min(market_return, cap)
-      2. If market goes down within buffer: ETF return = max(market_return + buffer, 0)
-         (but accounting for downside_before_buffer for ultra products)
-      3. If market goes down beyond buffer: ETF return follows 1:1
-
-    More precisely for standard/power buffers (downside_before_buffer == 0):
+    For standard/power buffers (downside_before_buffer == 0):
       - market_return >= 0:  ETF return = min(market_return, cap)
       - -buffer <= market_return < 0:  ETF return = 0  (fully buffered)
       - market_return < -buffer:  ETF return = market_return + buffer
 
     For ultra buffers (downside_before_buffer > 0, e.g., 5%):
       - market_return >= 0:  ETF return = min(market_return, cap)
-      - 0 > market_return >= -downside_before_buffer:  ETF return = market_return (1:1 loss)
-      - -downside_before_buffer > market_return >= -(downside_before_buffer + buffer):
-            ETF return = -downside_before_buffer  (buffered zone)
-      - market_return < -(downside_before_buffer + buffer):
-            ETF return = market_return + buffer
+      - 0 > market_return >= -gap:  ETF return = market_return (1:1 loss in gap)
+      - -gap > market_return >= -(gap + buffer):  ETF return = -gap (buffered)
+      - market_return < -(gap + buffer):  ETF return = market_return + buffer
 
     Args:
-        market_return: The forward return of the underlying index as a decimal
-            (e.g., 0.10 for +10%, -0.20 for -20%).
+        market_return: Reference asset return from period start to expiry (decimal).
         params: PayoffParams defining the cap, buffer, and any gap.
 
     Returns:
-        The ETF's return as a decimal (e.g., 0.12 for +12%).
+        The ETF's return from period start as a decimal.
 
     Examples:
         >>> params = PayoffParams(cap=0.15, buffer=0.09)
-        >>> calculate_buffer_etf_return(0.10, params)   # +10% market
+        >>> calculate_buffer_etf_return(0.10, params)
         0.10
-        >>> calculate_buffer_etf_return(0.20, params)   # +20% market, capped
+        >>> calculate_buffer_etf_return(0.20, params)   # capped
         0.15
-        >>> calculate_buffer_etf_return(-0.05, params)  # -5% market, buffered
+        >>> calculate_buffer_etf_return(-0.05, params)  # buffered
         0.0
-        >>> calculate_buffer_etf_return(-0.15, params)  # -15% market, beyond buffer
+        >>> calculate_buffer_etf_return(-0.15, params)  # beyond buffer
         -0.06
     """
     cap = params.cap
@@ -133,188 +133,217 @@ def calculate_buffer_etf_return(
     if market_return >= 0:
         return min(market_return, cap)
 
-    # --- DOWNSIDE: Three zones depending on buffer type ---
+    # --- DOWNSIDE: Zones depend on buffer type ---
 
     if gap > 0:
         # Ultra buffer: investor loses 1:1 in the gap, then buffer kicks in
-        # Zone 1: Loss within the gap (0 to -gap)
         if market_return >= -gap:
             return market_return  # 1:1 loss in the gap
-
-        # Zone 2: Loss within the buffer zone (-gap to -(gap + buffer))
         if market_return >= -(gap + buffer):
-            return -gap  # Loss is frozen at the gap amount
-
-        # Zone 3: Loss beyond the buffer
-        # The investor loses 1:1 for the portion beyond (gap + buffer)
-        return market_return + buffer
+            return -gap  # Loss frozen at the gap amount
+        return market_return + buffer  # 1:1 beyond the buffer
 
     else:
         # Standard / Power buffer: protection starts at 0%
-        # Zone 1: Loss within the buffer (0 to -buffer)
         if market_return >= -buffer:
             return 0.0  # Fully protected
-
-        # Zone 2: Loss beyond the buffer — 1:1 participation
-        # If market is down 15% and buffer is 9%, ETF return = -15% + 9% = -6%
-        return market_return + buffer
+        return market_return + buffer  # 1:1 beyond the buffer
 
 
-def calculate_hold_value(
-    position_value: float,
-    market_return: float,
-    remaining_cap: float,
-    remaining_buffer: float,
+def calculate_hold_investor_return(
+    forward_ref_return: float,
+    current_ref_return: float,
+    fund_return: float,
+    starting_cap: float,
+    starting_buffer: float,
     downside_before_buffer: float = 0.0,
 ) -> float:
     """
-    Calculate the ending position value if holding the current ETF to reset.
+    Calculate the investor's return from current fund NAV if holding to expiry.
 
-    Uses the remaining cap and remaining buffer (from the current price to
-    the reset date) to model the payoff.
+    This is the core "hold" calculation. It correctly models the relationship
+    between forward reference asset moves and the investor's actual outcome:
+
+      1. Compound the forward reference return with the current reference
+         return to get the total reference return from period start to expiry.
+      2. Apply the at-expiry payoff using the STARTING cap and buffer.
+      3. Express the result as a return from the CURRENT fund NAV.
+
+    Why this matters: If the fund is up 10% and the reference is up 15%, a
+    -10% forward reference move results in a total reference return of
+    (1.15)(0.90) - 1 = +3.5%. The at-expiry payoff for +3.5% is +3.5%
+    (below cap). The fund NAV at expiry is 1.0 * 1.035 = 1.035. From the
+    current fund NAV of 1.10, the investor's return is 1.035/1.10 - 1 = -5.9%.
 
     Args:
-        position_value: Current dollar value of the position.
-        market_return: Expected forward return of the underlying index from
-            now until the reset date.
-        remaining_cap: Remaining upside cap from current price (decimal).
-        remaining_buffer: Remaining downside buffer from current price (decimal).
-        downside_before_buffer: Gap before buffer for ultra products (decimal).
+        forward_ref_return: Expected reference asset return from today to
+            expiry (decimal, e.g., -0.10 for -10%).
+        current_ref_return: Reference asset return from period start to today
+            (decimal, e.g., 0.15 for +15%).
+        fund_return: Fund NAV return from period start to today
+            (decimal, e.g., 0.10 for +10%).
+        starting_cap: Cap set at the beginning of the outcome period.
+        starting_buffer: Buffer set at the beginning of the outcome period.
+        downside_before_buffer: Gap before buffer for ultra products.
 
     Returns:
-        Ending dollar value of the position at the reset date.
+        Investor's return from current fund NAV (decimal).
 
-    Example:
-        >>> calculate_hold_value(100000, 0.05, 0.10, 0.08)
-        105000.0  # 5% gain on $100k
-        >>> calculate_hold_value(100000, 0.15, 0.10, 0.08)
-        110000.0  # Capped at 10%
+    Examples:
+        >>> # Ref up 15%, fund up 10%, 18% cap, 9% buffer, forward ref -10%
+        >>> calculate_hold_investor_return(-0.10, 0.15, 0.10, 0.18, 0.09)
+        -0.059...  # Fund NAV goes from 1.10 to 1.035
     """
+    # Step 1: Total reference return from period start to expiry
+    total_ref_return = (1.0 + current_ref_return) * (1.0 + forward_ref_return) - 1.0
+
+    # Step 2: At-expiry payoff based on starting cap/buffer
     params = PayoffParams(
-        cap=remaining_cap,
-        buffer=remaining_buffer,
+        cap=starting_cap,
+        buffer=starting_buffer,
         downside_before_buffer=downside_before_buffer,
     )
-    etf_return = calculate_buffer_etf_return(market_return, params)
-    return position_value * (1.0 + etf_return)
+    fund_return_at_expiry = calculate_buffer_etf_return(total_ref_return, params)
+
+    # Step 3: Convert to investor return from current fund NAV
+    # Starting NAV is normalized to 1.0
+    # Fund NAV at expiry = 1.0 * (1 + fund_return_at_expiry)
+    # Current fund NAV = 1.0 * (1 + fund_return)
+    # Investor return = (expiry_nav / current_nav) - 1
+    current_nav = 1.0 + fund_return
+    expiry_nav = 1.0 + fund_return_at_expiry
+
+    return (expiry_nav / current_nav) - 1.0
 
 
-def calculate_roll_value(
-    position_value: float,
-    market_return: float,
+def calculate_roll_investor_return(
+    forward_ref_return: float,
     new_cap: float,
     new_buffer: float,
-    transaction_cost: float = 0.0,
-    tax_drag: float = 0.0,
     new_downside_before_buffer: float = 0.0,
 ) -> float:
     """
-    Calculate the ending position value if rolling into a new ETF.
+    Calculate the new ETF's at-expiry return for a given forward reference move.
 
-    The roll strategy:
-      1. Sell the current position (incurring transaction costs and possibly taxes).
-      2. Buy the new ETF with fresh cap and buffer.
-      3. The new ETF's payoff applies to the post-cost/tax position value.
+    The roll strategy starts a fresh outcome period, so the forward reference
+    return IS the total reference return from the new period start. The
+    at-expiry payoff applies directly.
+
+    Note: This returns the ETF's return only. Transaction costs and tax drag
+    are applied separately at the position-value level in the scenario engine.
 
     Args:
-        position_value: Current dollar value of the position.
-        market_return: Expected forward return of the underlying index over
-            the new ETF's full outcome period.
+        forward_ref_return: Expected reference asset return from today (decimal).
         new_cap: The new ETF's starting cap (decimal).
         new_buffer: The new ETF's starting buffer (decimal).
-        transaction_cost: Total cost to execute the roll as a decimal of
-            position value (e.g., 0.001 for 10 basis points).
-        tax_drag: Tax cost from realizing gains, as a dollar amount.
-            (Calculated separately by tax.py based on gains and tax rate.)
-        new_downside_before_buffer: Gap for ultra buffer products (decimal).
+        new_downside_before_buffer: Gap before buffer for ultra products.
 
     Returns:
-        Ending dollar value of the position after rolling.
-
-    Example:
-        >>> calculate_roll_value(100000, 0.10, 0.18, 0.15, 0.001, 500)
-        # Sell: $100,000 - $100 (0.1% cost) - $500 (tax) = $99,400
-        # New ETF return at +10%: min(10%, 18%) = 10%
-        # Ending value: $99,400 * 1.10 = $109,340
+        The new ETF's return at expiry (decimal).
     """
-    # Step 1: Calculate proceeds after transaction costs and taxes
-    proceeds = position_value * (1.0 - transaction_cost) - tax_drag
-
-    # Step 2: Apply the new ETF's payoff structure
     params = PayoffParams(
         cap=new_cap,
         buffer=new_buffer,
         downside_before_buffer=new_downside_before_buffer,
     )
-    etf_return = calculate_buffer_etf_return(market_return, params)
-
-    return proceeds * (1.0 + etf_return)
+    return calculate_buffer_etf_return(forward_ref_return, params)
 
 
-def estimate_remaining_params(
+def calculate_downside_metrics(
+    fund_return: float,
+    current_ref_return: float,
     starting_cap: float,
     starting_buffer: float,
-    current_return_since_start: float,
     downside_before_buffer: float = 0.0,
-) -> tuple[float, float]:
+) -> dict:
     """
-    Estimate remaining cap and remaining buffer from current position.
+    Calculate key downside risk metrics from the investor's current position.
 
-    When the underlying index has moved since the outcome period started,
-    the remaining cap and buffer shift accordingly:
+    These metrics help advisors communicate the REAL risk to clients. The
+    critical insight: if the fund is up 10%, the client's first ~9.1% of
+    downside from current NAV is just giving back gains — the buffer doesn't
+    protect against that.
 
-      - If the market is UP since start:
-        * Remaining cap decreases (less upside room)
-        * Remaining buffer increases (more downside protection)
-
-      - If the market is DOWN since start:
-        * Remaining cap increases (more upside room)
-        * Remaining buffer decreases (less protection left)
-        * If the market has fallen past the buffer, remaining buffer is 0
-
-    This is a simplified linear estimate. The actual remaining values depend
-    on the ETF's NAV and the options pricing, but this gives a reasonable
-    approximation.
+    Metrics calculated:
+      - downside_to_period_start: How much the investor loses from current NAV
+            if the reference asset returns to 0% (flat from period start).
+            This is the "unprotected" portion of their current gain.
+      - downside_to_buffer_exhaustion: How much the investor loses from current
+            NAV when the reference asset hits -buffer% from period start. The
+            buffer absorbs losses in this zone, but the investor still loses
+            their accumulated gain.
+      - ref_forward_to_zero: How much the reference asset must fall from its
+            current level to return to its period-start level.
+      - ref_forward_to_buffer_edge: How much the reference asset must fall from
+            its current level to exhaust the buffer.
+      - remaining_cap_from_nav: Maximum additional return from current fund NAV.
 
     Args:
-        starting_cap: The cap at the beginning of the outcome period.
-        starting_buffer: The buffer at the beginning of the outcome period.
-        current_return_since_start: The underlying index return since the
-            outcome period started (decimal).
-        downside_before_buffer: Gap before buffer for ultra products.
+        fund_return: Fund NAV return from period start (decimal).
+        current_ref_return: Reference asset return from period start (decimal).
+        starting_cap: Cap at period start (decimal).
+        starting_buffer: Buffer at period start (decimal).
+        downside_before_buffer: Gap for ultra buffers (decimal).
 
     Returns:
-        Tuple of (remaining_cap, remaining_buffer) as decimals.
+        Dictionary of downside risk metrics.
 
-    Examples:
-        >>> estimate_remaining_params(0.15, 0.09, 0.05)
-        (0.10, 0.14)  # Market up 5%: cap shrinks, buffer grows
-        >>> estimate_remaining_params(0.15, 0.09, -0.03)
-        (0.18, 0.06)  # Market down 3%: cap grows, buffer shrinks
+    Example:
+        >>> metrics = calculate_downside_metrics(0.10, 0.15, 0.18, 0.09)
+        >>> metrics["downside_to_period_start"]
+        -0.0909...  # Lose ~9.1% from current NAV to get back to start
     """
-    r = current_return_since_start
+    current_nav = 1.0 + fund_return
+    starting_nav = 1.0
 
-    if r >= 0:
-        # Market is up: cap has been partially consumed, buffer has grown
-        remaining_cap = max(0.0, starting_cap - r)
-        remaining_buffer = starting_buffer + r
+    params = PayoffParams(
+        cap=starting_cap,
+        buffer=starting_buffer,
+        downside_before_buffer=downside_before_buffer,
+    )
+
+    # --- Fund value when reference returns to 0% from period start ---
+    # At ref = 0%, fund return from start = payoff(0%) = 0% → fund NAV = 1.0
+    fund_at_ref_zero = starting_nav  # Always 1.0 for standard buffers
+    investor_return_at_ref_zero = (fund_at_ref_zero / current_nav) - 1.0
+
+    # --- Fund value at buffer exhaustion ---
+    # Standard: ref = -buffer%, fund = 0% from start
+    # Ultra: ref = -(gap + buffer), fund = -gap from start
+    if downside_before_buffer > 0:
+        buffer_edge_ref = -(downside_before_buffer + starting_buffer)
+        fund_return_at_edge = calculate_buffer_etf_return(buffer_edge_ref, params)
     else:
-        # Market is down: cap has grown, buffer has been partially consumed
-        remaining_cap = starting_cap + abs(r)
+        buffer_edge_ref = -starting_buffer
+        fund_return_at_edge = 0.0  # By definition, at buffer edge fund = 0%
+    fund_at_buffer_edge = starting_nav * (1.0 + fund_return_at_edge)
+    investor_return_at_buffer_edge = (fund_at_buffer_edge / current_nav) - 1.0
 
-        if downside_before_buffer > 0:
-            # Ultra buffer: the gap absorbs first
-            if abs(r) <= downside_before_buffer:
-                # Still in the gap zone — buffer hasn't been touched
-                remaining_buffer = starting_buffer
-            elif abs(r) <= downside_before_buffer + starting_buffer:
-                # In the buffer zone — some buffer consumed
-                remaining_buffer = starting_buffer - (abs(r) - downside_before_buffer)
-            else:
-                # Beyond the buffer — no protection left
-                remaining_buffer = 0.0
-        else:
-            # Standard/power buffer
-            remaining_buffer = max(0.0, starting_buffer - abs(r))
+    # --- Fund value at cap ---
+    fund_at_cap = starting_nav * (1.0 + starting_cap)
+    remaining_cap_from_nav = (fund_at_cap / current_nav) - 1.0
 
-    return remaining_cap, remaining_buffer
+    # --- Forward reference returns to reach key levels ---
+    # Forward return needed for ref to go from current to 0%
+    ref_forward_to_zero = -current_ref_return / (1.0 + current_ref_return)
+
+    # Forward return needed for ref to reach buffer edge from period start
+    ref_at_buffer_edge = buffer_edge_ref
+    ref_forward_to_buffer_edge = (
+        (1.0 + ref_at_buffer_edge) / (1.0 + current_ref_return) - 1.0
+    )
+
+    # Forward return needed for ref to reach cap
+    ref_forward_to_cap = (1.0 + starting_cap) / (1.0 + current_ref_return) - 1.0
+
+    return {
+        # Investor returns from current NAV at key reference levels
+        "downside_to_period_start": investor_return_at_ref_zero,
+        "downside_to_buffer_exhaustion": investor_return_at_buffer_edge,
+        "remaining_cap_from_nav": remaining_cap_from_nav,
+
+        # Forward reference moves needed to reach key levels
+        "ref_forward_to_zero": ref_forward_to_zero,
+        "ref_forward_to_buffer_edge": ref_forward_to_buffer_edge,
+        "ref_forward_to_cap": ref_forward_to_cap,
+    }
