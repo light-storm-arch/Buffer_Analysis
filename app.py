@@ -25,7 +25,7 @@ from datetime import date, timedelta
 from scraper import scrape_etf_page, get_ticker_suggestions, get_ticker_description, INNOVATOR_TICKERS
 from payoff import calculate_downside_metrics, calculate_hold_investor_return
 from scenarios import ScenarioInputs, run_scenarios
-from tax import TaxParams, format_tax_summary
+from tax import TaxParams, format_tax_summary, calculate_tax_drag
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +730,169 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
     )
 
     # -------------------------------------------------------------------
-    # Output Section E: Payoff Explanation (educational)
+    # Output Section E: Breakeven Background Calculations
+    # -------------------------------------------------------------------
+    if result.breakevens:
+        st.subheader("Background Calculations")
+
+        # Pre-compute roll costs — mirrors logic in run_scenarios
+        _tax_drag = calculate_tax_drag(position_value, tax_params)
+        _txn_cost = position_value * transaction_cost_rate
+        _roll_proceeds = position_value * (1.0 - transaction_cost_rate) - _tax_drag
+
+        def _payoff_zone(ref_total: float, cap: float, buffer: float, gap: float = 0.0):
+            """Return (payoff_decimal, zone_label) for a reference return."""
+            if ref_total >= 0:
+                if ref_total >= cap:
+                    return cap, f"**Capped** — total ref ({ref_total:+.2%}) ≥ cap ({cap:.2%})"
+                return ref_total, (
+                    f"**Upside participation** — 0% ≤ total ref ({ref_total:+.2%}) < cap ({cap:.2%})"
+                )
+            if gap > 0:
+                if ref_total >= -gap:
+                    return ref_total, (
+                        f"**Ultra gap (1:1 loss)** — total ref ({ref_total:+.2%}) "
+                        f"in [{-gap:.2%}, 0%)"
+                    )
+                if ref_total >= -(gap + buffer):
+                    return -gap, (
+                        f"**Buffered (frozen at {-gap:.2%})** — total ref ({ref_total:+.2%}) "
+                        f"in [{-(gap + buffer):.2%}, {-gap:.2%})"
+                    )
+                return ref_total + buffer, (
+                    f"**Beyond buffer** — total ref ({ref_total:+.2%}) "
+                    f"< {-(gap + buffer):.2%}"
+                )
+            if ref_total >= -buffer:
+                return 0.0, (
+                    f"**Buffered (0% return)** — total ref ({ref_total:+.2%}) "
+                    f"in [{-buffer:.2%}, 0%)"
+                )
+            return ref_total + buffer, (
+                f"**Beyond buffer** — total ref ({ref_total:+.2%}) < {-buffer:.2%}"
+            )
+
+        num_bes = len(result.breakevens)
+        for idx, (be_return, be_above) in enumerate(result.breakevens):
+            expander_label = (
+                f"Breakeven #{idx + 1} — Calculation Details"
+                if num_bes > 1
+                else "Breakeven — Calculation Details"
+            )
+
+            with st.expander(expander_label):
+                direction = "above" if be_above else "below"
+                st.markdown(
+                    f"**Breakeven forward reference return: {be_return * 100:+.2f}%** — "
+                    f"Roll wins {direction} this return. At this return the two strategies "
+                    f"produce equal portfolio outcomes."
+                )
+                st.divider()
+
+                # ---- Compute Hold at breakeven ----
+                total_ref = (1.0 + ref_return) * (1.0 + be_return) - 1.0
+                hold_payoff, hold_zone = _payoff_zone(
+                    total_ref, starting_cap, starting_buffer, current_gap
+                )
+                hold_inv_return = (1.0 + hold_payoff) / (1.0 + fund_return) - 1.0
+                hold_value_at_be = position_value * (1.0 + hold_inv_return)
+
+                # ---- Compute Roll at breakeven ----
+                roll_etf_return, roll_zone = _payoff_zone(
+                    be_return, new_cap, new_buffer, new_gap
+                )
+                roll_value_at_be = _roll_proceeds * (1.0 + roll_etf_return)
+                roll_inv_return = (roll_value_at_be / position_value) - 1.0
+
+                col_h, col_r = st.columns(2)
+
+                with col_h:
+                    st.markdown("##### Hold Calculation")
+                    st.markdown(
+                        f"**Step 1 — Total ref return from period start:**\n\n"
+                        f"The current ref return is compounded with the forward return "
+                        f"to get the full return the ETF payoff will be based on.\n\n"
+                        f"> (1 + {ref_return:.4f}) × (1 + {be_return:.4f}) − 1\n\n"
+                        f"> = **{total_ref:+.4f} ({total_ref:.2%})**"
+                    )
+                    st.markdown(
+                        f"**Step 2 — At-expiry payoff:**\n\n"
+                        f"Starting cap: {starting_cap:.2%} | Starting buffer: {starting_buffer:.2%}"
+                        + (f" | Ultra gap: {current_gap:.2%}" if current_gap > 0 else "")
+                        + f"\n\nZone: {hold_zone}\n\n"
+                        f"> At-expiry fund return (from period start) = **{hold_payoff:+.2%}**"
+                    )
+                    st.markdown(
+                        f"**Step 3 — Investor return from current fund NAV:**\n\n"
+                        f"The at-expiry fund NAV is divided by the current fund NAV "
+                        f"to express the outcome from the investor's current cost basis.\n\n"
+                        f"> (1 + {hold_payoff:.4f}) / (1 + {fund_return:.4f}) − 1\n\n"
+                        f"> = **{hold_inv_return:+.2%}**\n\n"
+                        f"> Hold ending value: ${position_value:,.0f} × "
+                        f"(1 + {hold_inv_return:.4f}) = **${hold_value_at_be:,.2f}**"
+                    )
+
+                with col_r:
+                    st.markdown("##### Roll Calculation")
+                    st.markdown(
+                        f"**Step 1 — Transaction cost:**\n\n"
+                        f"> ${position_value:,.0f} × {transaction_cost_rate:.4f} "
+                        f"= **${_txn_cost:,.2f}**"
+                    )
+
+                    if is_taxable:
+                        gain_loss = position_value - cost_basis
+                        combined_rate = (tax_rate_pct + state_tax_pct) / 100.0
+                        gl_label = "gain" if gain_loss >= 0 else "loss"
+                        st.markdown(
+                            f"**Step 2 — Tax drag:**\n\n"
+                            f"> Realized {gl_label}: "
+                            f"${position_value:,.0f} − ${cost_basis:,.0f} "
+                            f"= **${gain_loss:+,.2f}**\n\n"
+                            f"> Combined tax rate: {tax_rate_pct:.1f}% fed "
+                            f"+ {state_tax_pct:.1f}% state = {combined_rate:.2%}\n\n"
+                            f"> Tax = ${gain_loss:+,.2f} × {combined_rate:.4f} "
+                            f"= **${_tax_drag:+,.2f}**"
+                        )
+                    else:
+                        st.markdown(
+                            "**Step 2 — Tax drag:** $0 (tax-advantaged account)"
+                        )
+
+                    st.markdown(
+                        f"**Step 3 — Roll proceeds after costs and taxes:**\n\n"
+                        f"> ${position_value:,.0f} × (1 − {transaction_cost_rate:.4f}) "
+                        f"− ${_tax_drag:,.2f}\n\n"
+                        f"> = **${_roll_proceeds:,.2f}**"
+                    )
+                    st.markdown(
+                        f"**Step 4 — New ETF payoff:**\n\n"
+                        f"New cap: {new_cap:.2%} | New buffer: {new_buffer:.2%}"
+                        + (f" | Ultra gap: {new_gap:.2%}" if new_gap > 0 else "")
+                        + f"\n\nZone: {roll_zone}\n\n"
+                        f"> New ETF return = **{roll_etf_return:+.2%}**"
+                    )
+                    st.markdown(
+                        f"**Step 5 — Roll ending value and investor return:**\n\n"
+                        f"> ${_roll_proceeds:,.2f} × (1 + {roll_etf_return:.4f}) "
+                        f"= **${roll_value_at_be:,.2f}**\n\n"
+                        f"> Roll investor return: "
+                        f"${roll_value_at_be:,.2f} / ${position_value:,.0f} − 1 "
+                        f"= **{roll_inv_return:+.2%}**"
+                    )
+
+                st.divider()
+                st.caption(
+                    f"At {be_return * 100:+.2f}% forward ref return — "
+                    f"Hold: ${hold_value_at_be:,.2f} ({hold_inv_return:+.2%}) | "
+                    f"Roll: ${roll_value_at_be:,.2f} ({roll_inv_return:+.2%}). "
+                    f"Small differences are expected: the breakeven is found by "
+                    f"linear interpolation between 1% grid points, so the two "
+                    f"values may not be exactly equal at the interpolated point."
+                )
+
+    # -------------------------------------------------------------------
+    # Output Section F: Payoff Explanation (educational)
     # -------------------------------------------------------------------
     with st.expander("Understanding the Buffer ETF Payoff Structure"):
         st.markdown("""
