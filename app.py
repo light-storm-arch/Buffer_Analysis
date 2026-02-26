@@ -21,6 +21,12 @@ from payoff import calculate_downside_metrics, calculate_hold_investor_return
 from scenarios import ScenarioInputs, run_scenarios
 from tax import TaxParams, format_tax_summary, calculate_tax_drag
 from option_pricing import BSMInputs, BSMResult, bsm_price, binomial_price, binomial_greeks, implied_volatility
+from buffer_etf_pricing import (
+    OptionLeg, PortfolioDefinition, ScenarioParams,
+    TEMPLATES, get_template, price_portfolio,
+    compute_nav_vs_underlying, compute_payoff_at_expiry,
+    compute_nav_over_time, compute_leg_pnl_vs_underlying,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +46,7 @@ st.set_page_config(
 with st.sidebar:
     active_module = st.radio(
         "Module",
-        options=["Buffer Analysis", "Option Pricing Calculator"],
+        options=["Buffer Analysis", "Option Pricing Calculator", "Buffer ETF Pricing"],
         index=0,
     )
     st.divider()
@@ -1360,6 +1366,530 @@ S·e^(-qT) - K·e^(-rT) = {spot_price:.2f} × {_exp_qT:.6f} - {strike_price:.2f}
 
 Difference: {abs(parity_lhs - parity_rhs):.2e} (should be ~0)
 """)
+
+
+# =========================================================================
+# MODULE: Buffer ETF Pricing
+# =========================================================================
+elif active_module == "Buffer ETF Pricing":
+
+    st.title("Buffer ETF Pricing")
+    st.markdown(
+        "Model a **Buffer ETF** as a portfolio of options. Define the underlying "
+        "option legs (or pick a template), then adjust market scenarios to see how "
+        "the synthetic ETF's NAV responds over time relative to the underlying."
+    )
+
+    # -------------------------------------------------------------------
+    # Session state initialisation
+    # -------------------------------------------------------------------
+    if "betf_legs" not in st.session_state:
+        st.session_state.betf_legs = []
+    if "betf_template" not in st.session_state:
+        st.session_state.betf_template = "Standard Buffer"
+
+    # -------------------------------------------------------------------
+    # Sidebar: Portfolio Definition
+    # -------------------------------------------------------------------
+    with st.sidebar:
+        st.header("Portfolio Setup")
+
+        # --- Underlying & dates ---
+        underlying_start = st.number_input(
+            "Underlying Starting Price ($)",
+            min_value=0.01,
+            value=500.0,
+            step=1.0,
+            format="%.2f",
+            help="Price of the underlying asset when the ETF was launched.",
+        )
+        start_date_input = st.date_input(
+            "Start Date",
+            value=date.today(),
+            help="Inception date of the Buffer ETF.",
+        )
+        default_expiry = start_date_input + timedelta(days=365)
+        expiry_date_input = st.date_input(
+            "Default Expiration Date",
+            value=default_expiry,
+            min_value=start_date_input + timedelta(days=1),
+            help="Default expiration for template legs. Individual legs can override this.",
+        )
+
+        st.divider()
+
+        # --- Rates ---
+        betf_rfr_pct = st.number_input(
+            "Risk-Free Rate (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=4.5,
+            step=0.1,
+            format="%.2f",
+            help="Annualized continuously compounded risk-free rate.",
+        )
+        betf_div_pct = st.number_input(
+            "Dividend Yield (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=1.3,
+            step=0.1,
+            format="%.2f",
+            help="Annualized continuous dividend yield of the underlying.",
+        )
+
+        st.divider()
+
+        # --- Template selector ---
+        st.header("Option Legs")
+        template_names = ["Custom"] + list(TEMPLATES.keys())
+        selected_template = st.selectbox(
+            "Template",
+            options=template_names,
+            index=template_names.index(st.session_state.betf_template)
+            if st.session_state.betf_template in template_names
+            else 0,
+            help="Pick a preset structure or choose Custom to build from scratch.",
+        )
+
+        if selected_template != "Custom":
+            tmpl_info = TEMPLATES[selected_template]
+            st.caption(f"_{tmpl_info['description']}_")
+
+        # Apply template button
+        if selected_template != "Custom":
+            if st.button("Apply Template", use_container_width=True, type="primary"):
+                st.session_state.betf_legs = [
+                    {
+                        "is_call": leg.is_call,
+                        "strike": leg.strike,
+                        "expiry_date": leg.expiry_date,
+                        "position": leg.position,
+                        "implied_vol": leg.implied_vol * 100.0,
+                        "label": leg.label,
+                    }
+                    for leg in get_template(
+                        selected_template,
+                        underlying_start,
+                        start_date_input,
+                        expiry_date_input,
+                    )
+                ]
+                st.session_state.betf_template = selected_template
+                st.rerun()
+
+        st.divider()
+
+        # --- Leg editor ---
+        legs_data = st.session_state.betf_legs
+
+        if not legs_data:
+            st.info("No option legs defined. Apply a template or add legs manually.")
+
+        legs_to_delete: list[int] = []
+        for idx, leg in enumerate(legs_data):
+            with st.expander(f"Leg {idx + 1}: {leg.get('label', '')}", expanded=False):
+                leg["label"] = st.text_input(
+                    "Label", value=leg.get("label", ""), key=f"leg_label_{idx}"
+                )
+                col_type, col_dir = st.columns(2)
+                with col_type:
+                    opt_type = st.radio(
+                        "Type",
+                        ["Call", "Put"],
+                        index=0 if leg.get("is_call", True) else 1,
+                        horizontal=True,
+                        key=f"leg_type_{idx}",
+                    )
+                    leg["is_call"] = opt_type == "Call"
+                with col_dir:
+                    direction = st.radio(
+                        "Direction",
+                        ["Long", "Short"],
+                        index=0 if leg.get("position", 1) > 0 else 1,
+                        horizontal=True,
+                        key=f"leg_dir_{idx}",
+                    )
+                    qty = st.number_input(
+                        "Quantity",
+                        min_value=1,
+                        value=abs(leg.get("position", 1)),
+                        step=1,
+                        key=f"leg_qty_{idx}",
+                    )
+                    leg["position"] = qty if direction == "Long" else -qty
+
+                leg["strike"] = st.number_input(
+                    "Strike ($)",
+                    min_value=0.01,
+                    value=float(leg.get("strike", underlying_start)),
+                    step=1.0,
+                    format="%.2f",
+                    key=f"leg_strike_{idx}",
+                )
+                leg["expiry_date"] = st.date_input(
+                    "Expiration",
+                    value=leg.get("expiry_date", expiry_date_input),
+                    min_value=start_date_input + timedelta(days=1),
+                    key=f"leg_expiry_{idx}",
+                )
+                leg["implied_vol"] = st.number_input(
+                    "Implied Vol (%)",
+                    min_value=0.1,
+                    max_value=500.0,
+                    value=float(leg.get("implied_vol", 20.0)),
+                    step=0.5,
+                    format="%.1f",
+                    key=f"leg_vol_{idx}",
+                )
+                if st.button("Delete Leg", key=f"leg_del_{idx}", type="secondary"):
+                    legs_to_delete.append(idx)
+
+        # Process deletions
+        if legs_to_delete:
+            for i in sorted(legs_to_delete, reverse=True):
+                st.session_state.betf_legs.pop(i)
+            st.rerun()
+
+        # Add leg button
+        if st.button("+ Add Leg", use_container_width=True):
+            st.session_state.betf_legs.append({
+                "is_call": True,
+                "strike": underlying_start,
+                "expiry_date": expiry_date_input,
+                "position": 1,
+                "implied_vol": 20.0,
+                "label": "",
+            })
+            st.rerun()
+
+    # -------------------------------------------------------------------
+    # Build portfolio from session state
+    # -------------------------------------------------------------------
+    legs_data = st.session_state.betf_legs
+    if not legs_data:
+        st.warning("Define at least one option leg in the sidebar to get started.")
+        st.stop()
+
+    portfolio_legs = [
+        OptionLeg(
+            is_call=ld["is_call"],
+            strike=ld["strike"],
+            expiry_date=ld["expiry_date"],
+            position=ld["position"],
+            implied_vol=ld["implied_vol"] / 100.0,
+            label=ld.get("label", ""),
+        )
+        for ld in legs_data
+    ]
+
+    portfolio = PortfolioDefinition(
+        legs=portfolio_legs,
+        underlying_start=underlying_start,
+        start_date=start_date_input,
+        risk_free_rate=betf_rfr_pct / 100.0,
+        dividend_yield=betf_div_pct / 100.0,
+    )
+
+    # -------------------------------------------------------------------
+    # Main area: Scenario Controls
+    # -------------------------------------------------------------------
+    st.subheader("Scenario Inputs")
+
+    latest_expiry = max(ld["expiry_date"] for ld in legs_data)
+
+    sc_col1, sc_col2, sc_col3, sc_col4 = st.columns(4)
+
+    with sc_col1:
+        underlying_return_pct = st.slider(
+            "Underlying Return (%)",
+            min_value=-50.0,
+            max_value=50.0,
+            value=0.0,
+            step=0.5,
+            help="Percentage move from the starting underlying price.",
+        )
+        scenario_price = underlying_start * (1 + underlying_return_pct / 100.0)
+        st.caption(f"Underlying price: **${scenario_price:.2f}**")
+
+    with sc_col2:
+        analysis_date_input = st.date_input(
+            "Analysis Date",
+            value=start_date_input,
+            min_value=start_date_input,
+            max_value=latest_expiry,
+            key="betf_analysis_date",
+            help="Date at which to evaluate the portfolio.",
+        )
+
+    with sc_col3:
+        vol_shift_pct = st.slider(
+            "Vol Shift (%)",
+            min_value=-20.0,
+            max_value=20.0,
+            value=0.0,
+            step=0.5,
+            help="Uniform additive shift applied to every leg's implied volatility.",
+        )
+
+    with sc_col4:
+        rate_shift_pct = st.slider(
+            "Rate Shift (%)",
+            min_value=-5.0,
+            max_value=5.0,
+            value=0.0,
+            step=0.1,
+            help="Additive shift to the risk-free rate.",
+        )
+
+    scenario = ScenarioParams(
+        underlying_price=scenario_price,
+        analysis_date=analysis_date_input,
+        vol_shift=vol_shift_pct / 100.0,
+        rate_shift=rate_shift_pct / 100.0,
+    )
+
+    # -------------------------------------------------------------------
+    # Price the portfolio
+    # -------------------------------------------------------------------
+    try:
+        result = price_portfolio(portfolio, scenario)
+    except (ValueError, ZeroDivisionError) as e:
+        st.error(f"Pricing error: {e}")
+        st.stop()
+
+    # -------------------------------------------------------------------
+    # NAV display
+    # -------------------------------------------------------------------
+    st.divider()
+    st.header("Buffer ETF NAV")
+
+    nav_cols = st.columns([2, 2, 3])
+    with nav_cols[0]:
+        st.metric(
+            "NAV",
+            f"${result.nav:.2f}",
+            delta=f"{result.nav_return:+.2%}",
+        )
+    with nav_cols[1]:
+        st.metric(
+            "Underlying Return",
+            f"{result.underlying_return:+.2%}",
+            delta=f"${scenario_price:.2f}",
+            delta_color="off",
+        )
+    with nav_cols[2]:
+        days_elapsed = (analysis_date_input - start_date_input).days
+        days_to_expiry = (latest_expiry - analysis_date_input).days
+        st.metric("Days Elapsed", f"{days_elapsed}")
+        st.caption(f"{days_to_expiry} days to expiration")
+
+    # -------------------------------------------------------------------
+    # Individual option legs
+    # -------------------------------------------------------------------
+    st.subheader("Option Legs")
+
+    # Header row
+    hdr_cols = st.columns([3, 1, 1, 1, 1, 1])
+    with hdr_cols[0]:
+        st.markdown("**Leg**")
+    with hdr_cols[1]:
+        st.markdown("**Price**")
+    with hdr_cols[2]:
+        st.markdown("**Change**")
+    with hdr_cols[3]:
+        st.markdown("**% Change**")
+    with hdr_cols[4]:
+        st.markdown("**Delta**")
+    with hdr_cols[5]:
+        st.markdown("**Theta/day**")
+
+    for lr in result.legs:
+        row_cols = st.columns([3, 1, 1, 1, 1, 1])
+        pos_str = f"{lr.position:+d}" if abs(lr.position) > 1 else ("+1" if lr.position > 0 else "-1")
+        type_str = "C" if lr.is_call else "P"
+        with row_cols[0]:
+            st.markdown(f"{lr.label}  \n`{pos_str} {lr.strike:.0f}{type_str}`")
+        with row_cols[1]:
+            st.metric("", f"${lr.current_price:.2f}")
+        with row_cols[2]:
+            st.metric("", f"${lr.price_change:+.2f}")
+        with row_cols[3]:
+            st.metric("", f"{lr.pct_change:+.1%}")
+        with row_cols[4]:
+            st.metric("", f"{lr.delta:+.4f}")
+        with row_cols[5]:
+            st.metric("", f"${lr.theta:+.4f}")
+
+    # -------------------------------------------------------------------
+    # Charts
+    # -------------------------------------------------------------------
+    st.divider()
+
+    # Underlying range for charts
+    s_lo = max(underlying_start * 0.5, 0.01)
+    s_hi = underlying_start * 1.5
+    s_arr = np.linspace(s_lo, s_hi, 200)
+    s_returns = (s_arr - underlying_start) / underlying_start * 100  # % returns
+
+    # ---------- Row 1 ----------
+    chart_r1c1, chart_r1c2 = st.columns(2)
+
+    # --- Chart 1: ETF Value vs Underlying Price ---
+    with chart_r1c1:
+        st.subheader("ETF NAV vs. Underlying Price")
+        nav_curve = compute_nav_vs_underlying(portfolio, scenario, s_arr)
+        underlying_nav = 100.0 * s_arr / underlying_start  # underlying as $100-normalised
+
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(
+            x=s_arr, y=nav_curve,
+            mode="lines", name="Buffer ETF NAV",
+            line=dict(color="#1f77b4", width=3),
+            hovertemplate="Underlying: $%{x:.2f}<br>ETF NAV: $%{y:.2f}<extra></extra>",
+        ))
+        fig1.add_trace(go.Scatter(
+            x=s_arr, y=underlying_nav,
+            mode="lines", name="Underlying (normalised)",
+            line=dict(color="#aaaaaa", width=2, dash="dash"),
+            hovertemplate="Underlying: $%{x:.2f}<br>Underlying NAV: $%{y:.2f}<extra></extra>",
+        ))
+        fig1.add_vline(
+            x=underlying_start, line_dash="dot", line_color="gray", opacity=0.5,
+            annotation_text=f"Start: ${underlying_start:.0f}",
+            annotation_position="top",
+        )
+        fig1.add_vline(
+            x=scenario_price, line_dash="dash", line_color="green", opacity=0.6,
+            annotation_text=f"Scenario: ${scenario_price:.0f}",
+            annotation_position="bottom",
+        )
+        fig1.add_hline(y=100, line_dash="dot", line_color="gray", opacity=0.3)
+        fig1.update_layout(
+            xaxis_title="Underlying Price ($)",
+            yaxis_title="NAV ($)",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            height=420,
+            margin=dict(l=60, r=30, t=30, b=60),
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+    # --- Chart 2: Option P&L Breakdown ---
+    with chart_r1c2:
+        st.subheader("Option P&L Breakdown")
+        leg_pnls = compute_leg_pnl_vs_underlying(portfolio, scenario, s_arr)
+
+        colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
+        fig2 = go.Figure()
+        for i, (label, pnl) in enumerate(leg_pnls.items()):
+            fig2.add_trace(go.Scatter(
+                x=s_arr, y=pnl,
+                mode="lines", name=label,
+                line=dict(color=colors[i % len(colors)], width=2),
+                hovertemplate="Underlying: $%{x:.2f}<br>P&L: $%{y:.2f}<extra></extra>",
+            ))
+
+        # Total P&L
+        total_pnl = sum(leg_pnls.values())
+        fig2.add_trace(go.Scatter(
+            x=s_arr, y=total_pnl,
+            mode="lines", name="Total P&L",
+            line=dict(color="white", width=3),
+            hovertemplate="Underlying: $%{x:.2f}<br>Total: $%{y:.2f}<extra></extra>",
+        ))
+
+        fig2.add_vline(
+            x=scenario_price, line_dash="dash", line_color="green", opacity=0.6,
+        )
+        fig2.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.4)
+        fig2.update_layout(
+            xaxis_title="Underlying Price ($)",
+            yaxis_title="P&L ($, NAV-scaled)",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            height=420,
+            margin=dict(l=60, r=30, t=30, b=60),
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ---------- Row 2 ----------
+    chart_r2c1, chart_r2c2 = st.columns(2)
+
+    # --- Chart 3: Payoff at Expiration ---
+    with chart_r2c1:
+        st.subheader("Payoff at Expiration")
+        payoff_curve = compute_payoff_at_expiry(portfolio, s_arr)
+        underlying_pnl = 100.0 * (s_arr / underlying_start - 1.0)  # underlying P&L from $100
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(
+            x=s_arr, y=payoff_curve,
+            mode="lines", name="ETF Payoff",
+            line=dict(color="#1f77b4", width=3),
+            hovertemplate="Underlying: $%{x:.2f}<br>ETF P&L: $%{y:.2f}<extra></extra>",
+        ))
+        fig3.add_trace(go.Scatter(
+            x=s_arr, y=underlying_pnl,
+            mode="lines", name="Underlying P&L",
+            line=dict(color="#aaaaaa", width=2, dash="dash"),
+            hovertemplate="Underlying: $%{x:.2f}<br>Underlying P&L: $%{y:.2f}<extra></extra>",
+        ))
+        fig3.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.4)
+        fig3.add_vline(
+            x=underlying_start, line_dash="dot", line_color="gray", opacity=0.5,
+        )
+        fig3.update_layout(
+            xaxis_title="Underlying Price at Expiry ($)",
+            yaxis_title="Profit / Loss ($)",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            height=420,
+            margin=dict(l=60, r=30, t=30, b=60),
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # --- Chart 4: ETF Value vs Time ---
+    with chart_r2c2:
+        st.subheader("ETF NAV vs. Time")
+
+        # Build a date range from start to latest expiry
+        total_days = (latest_expiry - start_date_input).days
+        step = max(total_days // 100, 1)
+        date_list = [
+            start_date_input + timedelta(days=d)
+            for d in range(0, total_days + 1, step)
+        ]
+        if date_list[-1] != latest_expiry:
+            date_list.append(latest_expiry)
+
+        nav_time = compute_nav_over_time(portfolio, scenario, date_list)
+
+        fig4 = go.Figure()
+        fig4.add_trace(go.Scatter(
+            x=date_list, y=nav_time,
+            mode="lines", name="ETF NAV",
+            line=dict(color="#1f77b4", width=3),
+            hovertemplate="Date: %{x}<br>NAV: $%{y:.2f}<extra></extra>",
+        ))
+        fig4.add_hline(y=100, line_dash="dot", line_color="gray", opacity=0.4,
+                        annotation_text="$100 (start)", annotation_position="right")
+        if start_date_input <= analysis_date_input <= latest_expiry:
+            fig4.add_vline(
+                x=analysis_date_input.isoformat(), line_dash="dash",
+                line_color="green", opacity=0.6,
+                annotation_text="Analysis date",
+                annotation_position="top",
+            )
+        fig4.update_layout(
+            xaxis_title="Date",
+            yaxis_title="NAV ($)",
+            hovermode="x unified",
+            height=420,
+            margin=dict(l=60, r=30, t=30, b=60),
+            showlegend=False,
+        )
+        st.plotly_chart(fig4, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
