@@ -1878,8 +1878,11 @@ elif active_module == "Buffer ETF Pricing":
             fig4.add_vline(
                 x=pd.Timestamp(analysis_date_input), line_dash="dash",
                 line_color="green", opacity=0.6,
-                annotation_text="Analysis date",
-                annotation_position="top",
+            )
+            fig4.add_annotation(
+                x=pd.Timestamp(analysis_date_input),
+                y=1, yref="paper", text="Analysis date",
+                showarrow=False, yanchor="bottom",
             )
         fig4.update_layout(
             xaxis_title="Date",
