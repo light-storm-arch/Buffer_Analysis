@@ -1598,7 +1598,7 @@ elif active_module == "Buffer ETF Pricing":
 
     latest_expiry = max(ld["expiry_date"] for ld in legs_data)
 
-    sc_col1, sc_col2, sc_col3, sc_col4 = st.columns(4)
+    sc_col1, sc_col2, sc_col3, sc_col4, sc_col5 = st.columns(5)
 
     with sc_col1:
         underlying_return_pct = st.slider(
@@ -1642,6 +1642,18 @@ elif active_module == "Buffer ETF Pricing":
             help="Additive shift to the risk-free rate.",
         )
 
+    with sc_col5:
+        market_nav_input = st.number_input(
+            "Market NAV ($)",
+            min_value=0.0,
+            max_value=500.0,
+            value=0.0,
+            step=0.01,
+            format="%.2f",
+            key="betf_market_nav",
+            help="Enter the actual ETF NAV to compare against the model's theoretical NAV. Leave at 0 to hide.",
+        )
+
     scenario = ScenarioParams(
         underlying_price=scenario_price,
         analysis_date=analysis_date_input,
@@ -1664,21 +1676,37 @@ elif active_module == "Buffer ETF Pricing":
     st.divider()
     st.header("Buffer ETF NAV")
 
-    nav_cols = st.columns([2, 2, 3])
-    with nav_cols[0]:
+    has_market_nav = market_nav_input > 0.0
+
+    nav_cols = st.columns([2, 2, 2, 3] if has_market_nav else [2, 2, 3])
+    col_idx = 0
+    with nav_cols[col_idx]:
         st.metric(
-            "NAV",
+            "Model NAV" if has_market_nav else "NAV",
             f"${result.nav:.2f}",
             delta=f"{result.nav_return:+.2%}",
         )
-    with nav_cols[1]:
+    col_idx += 1
+    if has_market_nav:
+        with nav_cols[col_idx]:
+            market_nav_return = (market_nav_input - 100.0) / 100.0
+            nav_diff = market_nav_input - result.nav
+            st.metric(
+                "Market NAV",
+                f"${market_nav_input:.2f}",
+                delta=f"{market_nav_return:+.2%}",
+            )
+            st.caption(f"Diff from model: **{nav_diff:+.2f}**")
+        col_idx += 1
+    with nav_cols[col_idx]:
         st.metric(
             "Underlying Return",
             f"{result.underlying_return:+.2%}",
             delta=f"${scenario_price:.2f}",
             delta_color="off",
         )
-    with nav_cols[2]:
+    col_idx += 1
+    with nav_cols[col_idx]:
         days_elapsed = (analysis_date_input - start_date_input).days
         days_to_expiry = (latest_expiry - analysis_date_input).days
         st.metric("Days Elapsed", f"{days_elapsed}")
