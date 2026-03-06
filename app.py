@@ -1876,7 +1876,7 @@ elif active_module == "Buffer ETF Pricing":
                         annotation_text="$100 (start)", annotation_position="right")
         if start_date_input <= analysis_date_input <= latest_expiry:
             fig4.add_vline(
-                x=analysis_date_input.isoformat(), line_dash="dash",
+                x=pd.Timestamp(analysis_date_input), line_dash="dash",
                 line_color="green", opacity=0.6,
                 annotation_text="Analysis date",
                 annotation_position="top",
