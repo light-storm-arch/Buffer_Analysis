@@ -1403,6 +1403,15 @@ elif active_module == "Buffer ETF Pricing":
             format="%.2f",
             help="Price of the underlying asset when the ETF was launched.",
         )
+        etf_nav_input = st.number_input(
+            "ETF Starting NAV ($)",
+            min_value=0.01,
+            value=100.0,
+            step=0.01,
+            format="%.2f",
+            help="Actual ETF NAV at inception. Model output is scaled from $100 notional to this value.",
+        )
+        nav_scale = etf_nav_input / 100.0
         start_date_input = st.date_input(
             "Start Date",
             value=date.today(),
@@ -1598,7 +1607,7 @@ elif active_module == "Buffer ETF Pricing":
 
     latest_expiry = max(ld["expiry_date"] for ld in legs_data)
 
-    sc_col1, sc_col2, sc_col3, sc_col4, sc_col5 = st.columns(5)
+    sc_col1, sc_col2, sc_col3, sc_col4 = st.columns(4)
 
     with sc_col1:
         underlying_return_pct = st.slider(
@@ -1642,18 +1651,6 @@ elif active_module == "Buffer ETF Pricing":
             help="Additive shift to the risk-free rate.",
         )
 
-    with sc_col5:
-        market_nav_input = st.number_input(
-            "Market NAV ($)",
-            min_value=0.0,
-            max_value=500.0,
-            value=0.0,
-            step=0.01,
-            format="%.2f",
-            key="betf_market_nav",
-            help="Enter the actual ETF NAV to compare against the model's theoretical NAV. Leave at 0 to hide.",
-        )
-
     scenario = ScenarioParams(
         underlying_price=scenario_price,
         analysis_date=analysis_date_input,
@@ -1676,37 +1673,23 @@ elif active_module == "Buffer ETF Pricing":
     st.divider()
     st.header("Buffer ETF NAV")
 
-    has_market_nav = market_nav_input > 0.0
+    scaled_nav = result.nav * nav_scale
 
-    nav_cols = st.columns([2, 2, 2, 3] if has_market_nav else [2, 2, 3])
-    col_idx = 0
-    with nav_cols[col_idx]:
+    nav_cols = st.columns([2, 2, 3])
+    with nav_cols[0]:
         st.metric(
-            "Model NAV" if has_market_nav else "NAV",
-            f"${result.nav:.2f}",
+            "NAV",
+            f"${scaled_nav:.2f}",
             delta=f"{result.nav_return:+.2%}",
         )
-    col_idx += 1
-    if has_market_nav:
-        with nav_cols[col_idx]:
-            market_nav_return = (market_nav_input - 100.0) / 100.0
-            nav_diff = market_nav_input - result.nav
-            st.metric(
-                "Market NAV",
-                f"${market_nav_input:.2f}",
-                delta=f"{market_nav_return:+.2%}",
-            )
-            st.caption(f"Diff from model: **{nav_diff:+.2f}**")
-        col_idx += 1
-    with nav_cols[col_idx]:
+    with nav_cols[1]:
         st.metric(
             "Underlying Return",
             f"{result.underlying_return:+.2%}",
             delta=f"${scenario_price:.2f}",
             delta_color="off",
         )
-    col_idx += 1
-    with nav_cols[col_idx]:
+    with nav_cols[2]:
         days_elapsed = (analysis_date_input - start_date_input).days
         days_to_expiry = (latest_expiry - analysis_date_input).days
         st.metric("Days Elapsed", f"{days_elapsed}")
@@ -1766,8 +1749,8 @@ elif active_module == "Buffer ETF Pricing":
     # --- Chart 1: ETF Value vs Underlying Price ---
     with chart_r1c1:
         st.subheader("ETF NAV vs. Underlying Price")
-        nav_curve = compute_nav_vs_underlying(portfolio, scenario, s_arr)
-        underlying_nav = 100.0 * s_arr / underlying_start  # underlying as $100-normalised
+        nav_curve = compute_nav_vs_underlying(portfolio, scenario, s_arr) * nav_scale
+        underlying_nav = etf_nav_input * s_arr / underlying_start  # underlying normalised to ETF NAV
 
         fig1 = go.Figure()
         fig1.add_trace(go.Scatter(
@@ -1792,7 +1775,7 @@ elif active_module == "Buffer ETF Pricing":
             annotation_text=f"Scenario: ${scenario_price:.0f}",
             annotation_position="bottom",
         )
-        fig1.add_hline(y=100, line_dash="dot", line_color="gray", opacity=0.3)
+        fig1.add_hline(y=etf_nav_input, line_dash="dot", line_color="gray", opacity=0.3)
         fig1.update_layout(
             xaxis_title="Underlying Price ($)",
             yaxis_title="NAV ($)",
@@ -1812,14 +1795,14 @@ elif active_module == "Buffer ETF Pricing":
         fig2 = go.Figure()
         for i, (label, pnl) in enumerate(leg_pnls.items()):
             fig2.add_trace(go.Scatter(
-                x=s_arr, y=pnl,
+                x=s_arr, y=pnl * nav_scale,
                 mode="lines", name=label,
                 line=dict(color=colors[i % len(colors)], width=2),
                 hovertemplate="Underlying: $%{x:.2f}<br>P&L: $%{y:.2f}<extra></extra>",
             ))
 
         # Total P&L
-        total_pnl = sum(leg_pnls.values())
+        total_pnl = sum(leg_pnls.values()) * nav_scale
         fig2.add_trace(go.Scatter(
             x=s_arr, y=total_pnl,
             mode="lines", name="Total P&L",
@@ -1847,8 +1830,8 @@ elif active_module == "Buffer ETF Pricing":
     # --- Chart 3: Payoff at Expiration ---
     with chart_r2c1:
         st.subheader("Payoff at Expiration")
-        payoff_curve = compute_payoff_at_expiry(portfolio, s_arr)
-        underlying_pnl = 100.0 * (s_arr / underlying_start - 1.0)  # underlying P&L from $100
+        payoff_curve = compute_payoff_at_expiry(portfolio, s_arr) * nav_scale
+        underlying_pnl = etf_nav_input * (s_arr / underlying_start - 1.0)  # underlying P&L from ETF NAV
 
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(
@@ -1891,7 +1874,7 @@ elif active_module == "Buffer ETF Pricing":
         if date_list[-1] != latest_expiry:
             date_list.append(latest_expiry)
 
-        nav_time = compute_nav_over_time(portfolio, scenario, date_list)
+        nav_time = compute_nav_over_time(portfolio, scenario, date_list) * nav_scale
 
         fig4 = go.Figure()
         fig4.add_trace(go.Scatter(
@@ -1900,8 +1883,8 @@ elif active_module == "Buffer ETF Pricing":
             line=dict(color="#1f77b4", width=3),
             hovertemplate="Date: %{x}<br>NAV: $%{y:.2f}<extra></extra>",
         ))
-        fig4.add_hline(y=100, line_dash="dot", line_color="gray", opacity=0.4,
-                        annotation_text="$100 (start)", annotation_position="right")
+        fig4.add_hline(y=etf_nav_input, line_dash="dot", line_color="gray", opacity=0.4,
+                        annotation_text=f"${etf_nav_input:.2f} (start)", annotation_position="right")
         if start_date_input <= analysis_date_input <= latest_expiry:
             fig4.add_vline(
                 x=pd.Timestamp(analysis_date_input), line_dash="dash",
